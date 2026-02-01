@@ -1,56 +1,68 @@
-# Nuke built-in rules and variables.
-MAKEFLAGS += -rR
+# Nuke built-in rules.
 .SUFFIXES:
 
 # This is the name that our final executable will have.
 # Change as needed.
 override OUTPUT := kernel
 
-# Convenience macro to reliably declare user overridable variables.
-override USER_VARIABLE = $(if $(filter $(origin $(1)),default undefined),$(eval override $(1) := $(2)))
-
-# Destination directory on install (should always be empty by default).
-$(call USER_VARIABLE,DESTDIR,)
-
 # Install prefix; /usr/local is a good, standard default pick.
-$(call USER_VARIABLE,PREFIX,/usr/local)
+PREFIX := /usr/local
+
+# User controllable toolchain and toolchain prefix.
+TOOLCHAIN :=
+TOOLCHAIN_PREFIX :=
+ifneq ($(TOOLCHAIN),)
+    ifeq ($(TOOLCHAIN_PREFIX),)
+        TOOLCHAIN_PREFIX := $(TOOLCHAIN)-
+    endif
+endif
 
 # User controllable C compiler command.
-$(call USER_VARIABLE,KCC,cc)
+ifneq ($(TOOLCHAIN_PREFIX),)
+    CC := $(TOOLCHAIN_PREFIX)gcc
+else
+    CC := cc
+endif
 
 # User controllable linker command.
-$(call USER_VARIABLE,KLD,ld)
+LD := $(TOOLCHAIN_PREFIX)ld
+
+# Defaults overrides for variables if using "llvm" as toolchain.
+ifeq ($(TOOLCHAIN),llvm)
+    CC := clang
+    LD := ld.lld
+endif
 
 # User controllable C flags.
-$(call USER_VARIABLE,KCFLAGS,-g -O2 -pipe)
+CFLAGS := -g -O2 -pipe
 
 # User controllable C preprocessor flags. We set none by default.
-$(call USER_VARIABLE,KCPPFLAGS,)
+CPPFLAGS :=
 
 # User controllable nasm flags.
-$(call USER_VARIABLE,KNASMFLAGS,-F dwarf -g)
+NASMFLAGS := -g
 
 # User controllable linker flags. We set none by default.
-$(call USER_VARIABLE,KLDFLAGS,)
+LDFLAGS :=
 
 # Ensure the dependencies have been obtained.
-ifneq ($(shell ( test '$(MAKECMDGOALS)' = clean || test '$(MAKECMDGOALS)' = distclean ); echo $$?),0)
-    ifeq ($(shell ( ! test -d freestnd-c-hdrs-0bsd || ! test -f src/cc-runtime.c || ! test -f src/limine.h ); echo $$?),0)
+ifneq ($(filter-out clean distclean,$(MAKECMDGOALS)),)
+    ifeq ($(wildcard .deps-obtained),)
         $(error Please run the ./get-deps script first)
     endif
 endif
 
-# Check if KCC is Clang.
-override KCC_IS_CLANG := $(shell ! $(KCC) --version 2>/dev/null | grep 'clang' >/dev/null 2>&1; echo $$?)
+# Check if CC is Clang.
+override CC_IS_CLANG := $(shell ! $(CC) --version 2>/dev/null | grep -q '^Target: '; echo $$?)
 
 # If the C compiler is Clang, set the target as needed.
-ifeq ($(KCC_IS_CLANG),1)
-    override KCC += \
-        -target x86_64-unknown-none
+ifeq ($(CC_IS_CLANG),1)
+    override CC += \
+        -target x86_64-unknown-none-elf
 endif
 
 # Internal C flags that should not be changed by the user.
-override KCFLAGS += \
+override CFLAGS += \
     -Wall \
     -Wextra \
     -std=gnu11 \
@@ -64,6 +76,7 @@ override KCFLAGS += \
     -fdata-sections \
     -m64 \
     -march=x86-64 \
+    -mabi=sysv \
     -mno-80387 \
     -mno-mmx \
     -mno-sse \
@@ -72,61 +85,64 @@ override KCFLAGS += \
     -mcmodel=kernel
 
 # Internal C preprocessor flags that should not be changed by the user.
-override KCPPFLAGS := \
+override CPPFLAGS := \
     -I src \
-    -isystem freestnd-c-hdrs-0bsd \
-    $(KCPPFLAGS) \
+    -I limine-protocol/include \
+    -isystem freestnd-c-hdrs/include \
+    $(CPPFLAGS) \
     -MMD \
     -MP
 
 # Internal nasm flags that should not be changed by the user.
-override KNASMFLAGS += \
-    -Wall \
-    -f elf64
+override NASMFLAGS := \
+    -f elf64 \
+    $(patsubst -g,-g -F dwarf,$(NASMFLAGS)) \
+    -Wall
 
 # Internal linker flags that should not be changed by the user.
-override KLDFLAGS += \
+override LDFLAGS += \
     -m elf_x86_64 \
     -nostdlib \
     -static \
     -z max-page-size=0x1000 \
-    -gc-sections \
-    -T linker.lds
+    --gc-sections \
+    -T src/arch/x86_64/linker.lds
 
 # Use "find" to glob all *.c, *.S, and *.asm files in the tree and obtain the
 # object and header dependency file names.
-override CFILES := $(shell cd src && find -L * -type f -name '*.c' | LC_ALL=C sort)
-override ASFILES := $(shell cd src && find -L * -type f -name '*.S' | LC_ALL=C sort)
-override NASMFILES := $(shell cd src && find -L * -type f -name '*.asm' | LC_ALL=C sort)
+override SRCFILES := $(shell find -L src cc-runtime/src -type f 2>/dev/null | LC_ALL=C sort)
+override CFILES := $(filter %.c,$(SRCFILES))
+override ASFILES := $(filter %.S,$(SRCFILES))
+override NASMFILES := $(filter %.asm,$(SRCFILES))
 override OBJ := $(addprefix obj/,$(CFILES:.c=.c.o) $(ASFILES:.S=.S.o) $(NASMFILES:.asm=.asm.o))
 override HEADER_DEPS := $(addprefix obj/,$(CFILES:.c=.c.d) $(ASFILES:.S=.S.d))
 
-# Default target.
+# Default target. This must come first, before header dependencies.
 .PHONY: all
 all: bin/$(OUTPUT)
-
-# Link rules for the final executable.
-bin/$(OUTPUT): GNUmakefile linker.lds $(OBJ)
-	mkdir -p "$$(dirname $@)"
-	$(KLD) $(OBJ) $(KLDFLAGS) -o $@
 
 # Include header dependencies.
 -include $(HEADER_DEPS)
 
+# Link rules for the final executable.
+bin/$(OUTPUT): GNUmakefile src/arch/x86_64/linker.lds $(OBJ)
+	mkdir -p "$(dir $@)"
+	$(LD) $(LDFLAGS) $(OBJ) -o $@
+
 # Compilation rules for *.c files.
-obj/%.c.o: src/%.c GNUmakefile
-	mkdir -p "$$(dirname $@)"
-	$(KCC) $(KCFLAGS) $(KCPPFLAGS) -c $< -o $@
+obj/%.c.o: %.c GNUmakefile
+	mkdir -p "$(dir $@)"
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # Compilation rules for *.S files.
-obj/%.S.o: src/%.S GNUmakefile
-	mkdir -p "$$(dirname $@)"
-	$(KCC) $(KCFLAGS) $(KCPPFLAGS) -c $< -o $@
+obj/%.S.o: %.S GNUmakefile
+	mkdir -p "$(dir $@)"
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # Compilation rules for *.asm (nasm) files.
-obj/%.asm.o: src/%.asm GNUmakefile
-	mkdir -p "$$(dirname $@)"
-	nasm $(KNASMFLAGS) $< -o $@
+obj/%.asm.o: %.asm GNUmakefile
+	mkdir -p "$(dir $@)"
+	nasm $(NASMFLAGS) $< -o $@
 
 # Remove object files and the final executable.
 .PHONY: clean
@@ -136,7 +152,7 @@ clean:
 # Remove everything built and generated including downloaded dependencies.
 .PHONY: distclean
 distclean: clean
-	rm -rf freestnd-c-hdrs-0bsd src/cc-runtime.c src/limine.h
+	rm -rf .deps-obtained .cache compile_commands.json freestnd-c-hdrs cc-runtime limine-protocol
 
 # Install the final built executable to its final on-root location.
 .PHONY: install

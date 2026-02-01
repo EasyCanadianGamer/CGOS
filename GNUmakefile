@@ -1,14 +1,17 @@
-# Nuke built-in rules and variables.
-MAKEFLAGS += -rR
+# Nuke built-in rules.
 .SUFFIXES:
 
-# Convenience macro to reliably declare user overridable variables.
-override USER_VARIABLE = $(if $(filter $(origin $(1)),default undefined),$(eval override $(1) := $(2)))
-
 # Default user QEMU flags. These are appended to the QEMU command calls.
-$(call USER_VARIABLE,QEMUFLAGS,-m 2G)
+QEMUFLAGS := -m 2G
 
-override IMAGE_NAME := emos
+override IMAGE_NAME := cgos
+
+# Toolchain for building the 'limine' executable for the host.
+HOST_CC := cc
+HOST_CFLAGS := -g -O2 -pipe
+HOST_CPPFLAGS :=
+HOST_LDFLAGS :=
+HOST_LIBS :=
 
 .PHONY: all
 all: $(IMAGE_NAME).iso
@@ -25,11 +28,10 @@ run: $(IMAGE_NAME).iso
 		$(QEMUFLAGS)
 
 .PHONY: run-uefi
-run-uefi: ovmf/ovmf-code-x86_64.fd ovmf/ovmf-vars-x86_64.fd $(IMAGE_NAME).iso
+run-uefi: edk2-ovmf $(IMAGE_NAME).iso
 	qemu-system-x86_64 \
 		-M q35 \
-		-drive if=pflash,unit=0,format=raw,file=ovmf/ovmf-code-x86_64.fd,readonly=on \
-		-drive if=pflash,unit=1,format=raw,file=ovmf/ovmf-vars-x86_64.fd \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-x86_64.fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-boot d \
 		$(QEMUFLAGS)
@@ -42,33 +44,31 @@ run-hdd: $(IMAGE_NAME).hdd
 		$(QEMUFLAGS)
 
 .PHONY: run-hdd-uefi
-run-hdd-uefi: ovmf/ovmf-code-x86_64.fd ovmf/ovmf-vars-x86_64.fd $(IMAGE_NAME).hdd
+run-hdd-uefi: edk2-ovmf $(IMAGE_NAME).hdd
 	qemu-system-x86_64 \
 		-M q35 \
-		-drive if=pflash,unit=0,format=raw,file=ovmf/ovmf-code-x86_64.fd,readonly=on \
-		-drive if=pflash,unit=1,format=raw,file=ovmf/ovmf-vars-x86_64.fd \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-x86_64.fd,readonly=on \
 		-hda $(IMAGE_NAME).hdd \
 		$(QEMUFLAGS)
 
-ovmf/ovmf-code-x86_64.fd:
-	mkdir -p ovmf
-	curl -Lo $@ https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/ovmf-code-x86_64.fd
-
-ovmf/ovmf-vars-x86_64.fd:
-	mkdir -p ovmf
-	curl -Lo $@ https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/ovmf-vars-x86_64.fd
+edk2-ovmf:
+	curl -L https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/edk2-ovmf.tar.gz | gunzip | tar -xf -
 
 limine/limine:
 	rm -rf limine
-	git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1
-	$(MAKE) -C limine
+	git clone https://codeberg.org/Limine/Limine.git limine --branch=v10.x-binary --depth=1
+	$(MAKE) -C limine \
+		CC="$(HOST_CC)" \
+		CFLAGS="$(HOST_CFLAGS)" \
+		CPPFLAGS="$(HOST_CPPFLAGS)" \
+		LDFLAGS="$(HOST_LDFLAGS)" \
+		LIBS="$(HOST_LIBS)"
 
-kernel-deps:
-	sh ./kernel/get-deps
-	touch kernel-deps
+kernel/.deps-obtained:
+	./kernel/get-deps
 
 .PHONY: kernel
-kernel: kernel-deps
+kernel: kernel/.deps-obtained
 	$(MAKE) -C kernel
 
 $(IMAGE_NAME).iso: limine/limine kernel
@@ -80,9 +80,9 @@ $(IMAGE_NAME).iso: limine/limine kernel
 	mkdir -p iso_root/EFI/BOOT
 	cp -v limine/BOOTX64.EFI iso_root/EFI/BOOT/
 	cp -v limine/BOOTIA32.EFI iso_root/EFI/BOOT/
-	xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
-		-no-emul-boot -boot-load-size 4 -boot-info-table \
-		--efi-boot boot/limine/limine-uefi-cd.bin \
+	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+		-no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+		-apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
 		iso_root -o $(IMAGE_NAME).iso
 	./limine/limine bios-install $(IMAGE_NAME).iso
@@ -91,7 +91,7 @@ $(IMAGE_NAME).iso: limine/limine kernel
 $(IMAGE_NAME).hdd: limine/limine kernel
 	rm -f $(IMAGE_NAME).hdd
 	dd if=/dev/zero bs=1M count=0 seek=64 of=$(IMAGE_NAME).hdd
-	sgdisk $(IMAGE_NAME).hdd -n 1:2048 -t 1:ef00
+	PATH=$$PATH:/usr/sbin:/sbin sgdisk $(IMAGE_NAME).hdd -n 1:2048 -t 1:ef00 -m 1
 	./limine/limine bios-install $(IMAGE_NAME).hdd
 	mformat -i $(IMAGE_NAME).hdd@@1M
 	mmd -i $(IMAGE_NAME).hdd@@1M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
@@ -108,4 +108,4 @@ clean:
 .PHONY: distclean
 distclean: clean
 	$(MAKE) -C kernel distclean
-	rm -rf kernel-deps limine ovmf
+	rm -rf limine edk2-ovmf
