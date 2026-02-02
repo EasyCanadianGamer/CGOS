@@ -2,6 +2,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <limine.h>
+#include <lib/serial.h>
+#include <lib/panic.h>
 
 // Set the base revision to 4, this is recommended as this is the latest
 // base revision described by the Limine boot protocol specification.
@@ -29,6 +31,9 @@ static volatile uint64_t limine_requests_start_marker[] = LIMINE_REQUESTS_START_
 
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t limine_requests_end_marker[] = LIMINE_REQUESTS_END_MARKER;
+
+
+
 
 // GCC and Clang reserve the right to generate calls to the following
 // 4 functions even if they are not directly called.
@@ -98,26 +103,52 @@ static void hcf(void) {
 // If renaming kmain() to something else, make sure to change the
 // linker script accordingly.
 void kmain(void) {
-    // Ensure the bootloader actually understands our base revision (see spec).
+    serial_init();
+
+    serial_print("CGOS Booted! (Ch2 I/O basics)\r\n");
+
+    // Check base revision (very important!)
     if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == false) {
-        hcf();
+        panic("Bootloader does not support required Limine base revision 4");
     }
 
-    // Ensure we got a framebuffer.
-    if (framebuffer_request.response == NULL
-     || framebuffer_request.response->framebuffer_count < 1) {
-        hcf();
+    // Print useful Limine info (Ch2: understand boot environment)
+
+
+    // Framebuffer check & draw
+    if (framebuffer_request.response == NULL ||
+        framebuffer_request.response->framebuffer_count < 1) {
+        panic("Limine did not provide a framebuffer");
     }
 
-    // Fetch the first framebuffer.
-    struct limine_framebuffer *framebuffer = framebuffer_request.response->framebuffers[0];
+    struct limine_framebuffer *fb = framebuffer_request.response->framebuffers[0];
 
-    // Note: we assume the framebuffer model is RGB with 32-bit pixels.
-    for (size_t i = 0; i < 100; i++) {
-        volatile uint32_t *fb_ptr = framebuffer->address;
-        fb_ptr[i * (framebuffer->pitch / 4) + i] = 0xffffff;
+    serial_print("Framebuffer base: ");
+    serial_print_hex((uintptr_t)fb->address);
+    serial_print("\r\n");
+
+    serial_print("Resolution: ");
+    serial_print_hex(fb->width);
+    serial_print("x");
+    serial_print_hex(fb->height);
+    serial_print("  bpp: ");
+    serial_print_hex(fb->bpp);
+    serial_print("  pitch: ");
+    serial_print_hex(fb->pitch);
+    serial_print("\r\n");
+
+    if (fb->bpp != 32) {
+        panic("Framebuffer is not 32-bit RGBA - cannot draw safely");
+    } else {
+        // Safe diagonal white line (top-left to bottom-right-ish)
+        for (size_t i = 0; i < 100 && i < fb->width && i < fb->height; i++) {
+            volatile uint32_t *pixel = (volatile uint32_t *)fb->address +
+                                       i * (fb->pitch / 4) + i;
+            *pixel = 0x00ffffff;   // white (ARGB or whatever your FB uses)
+        }
+        serial_print("Drew diagonal white line\r\n");
     }
 
-    // We're done, just hang...
+    // Hang forever
     hcf();
 }
